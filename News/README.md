@@ -1,106 +1,377 @@
-# News Aggregation System
+# Scalable News Aggregator
 
-A system design for a large-scale, near-real-time news aggregation platform. The design ingests articles from multiple sources, removes duplicates, groups related coverage into stories, ranks those stories, and serves topic-based feeds efficiently.
+A high-level system design for a **scalable, real-time news aggregation platform** that ingests articles from multiple sources, normalizes and deduplicates them, clusters related coverage into stories, ranks those stories, and builds personalized user feeds.
 
-## Architecture
+![News Aggregator Architecture](news-agg.svg)
 
-```text
-RSS / Websites / Social Sources
-              |
-           Ingestion
-              |
-            Kafka
-              |
-         Normalization
-              |
-       Vector Deduplication
-              |
-      Online Story Clustering
-              |
-        Cluster Labelling
-              |
-            Ranking
-              |
-   Redis sorted sets by topic
-              |
-        Feed Service
-       fan-out-on-read
+## Requirements
+
+### Functional requirements
+
+1. Ingest articles from multiple news sources.
+2. Normalize incoming articles into a common format.
+3. Deduplicate articles reporting the same content.
+4. Cluster similar articles into a single story.
+5. Determine story popularity.
+6. Rank stories.
+7. Build personalized feeds for users.
+
+### Non-functional requirements
+
+- Support **high-volume ingestion**.
+- Provide **real-time updates**.
+- Be **fault tolerant**.
+
+## Core Entities
+
+- **News Source**
+- **Article**
+- **User**
+- **Story / Cluster** — a group of related articles covering the same event or topic.
+
+## Feed API
+
+```http
+GET /feed?page={page}&limit={limit}&region={region}
 ```
 
-Each processing stage is decoupled through Kafka so that stages can be scaled independently and failures can be isolated.
+Response:
 
-## Core Components
+```text
+Article[]
+```
 
-- **Ingestion:** Collects articles and metadata from RSS feeds, websites, and social sources.
-- **Normalization:** Produces a consistent article representation and removes malformed or incomplete data.
-- **Deduplication:** Uses embeddings and vector similarity to detect repeated coverage of the same article or event.
-- **Online clustering:** Compares new articles with active story centroids and groups related coverage.
-- **Labelling:** Generates a readable label for each story cluster.
-- **Ranking:** Combines freshness, popularity, source reliability, and other signals into a story score.
-- **Redis feed indexes:** Maintains top stories in sorted sets for each topic.
-- **Feed service:** Merges and reranks topic-level results at read time to build a user feed.
+## High-Level Architecture
 
-## Scale Assumptions
+The system is built as an event-driven pipeline around **Kafka**. Each processing stage consumes jobs from Kafka, performs one responsibility, persists any required state, and publishes work for the next stage.
 
-The initial sizing model assumes:
+```text
+RSS Feeds ───────> RSS Feed Producer ───┐
+Websites ────────> Website Producer ─────┼──> Kafka
+Social Media ────> Social Media Producer ┘
+                                           │
+                                           v
+                              Normalization Service
+                                           │
+                                           v
+                                  Deduplication Service
+                                           │
+                                           v
+                                    Clustering Service
+                                           │
+                            ┌──────────────┴──────────────┐
+                            v                             v
+                  Cluster Labelling Service        Ranking Service
+                                                          │
+                                                          v
+                                                        Redis
+                                                          │
+                                                          v
+User ──> API Gateway ──> Feed Service ────────────────────┘
+```
 
-| Metric | Estimate |
-| --- | ---: |
-| Daily active users | 10 million |
-| Feed requests per day | 150 million |
-| Average feed QPS | 1,750 |
-| Peak feed QPS | 5,000-9,000 |
-| Raw articles per day | 5 million |
-| Unique articles after deduplication | 3.25 million/day |
-| New story clusters per day | 300,000 |
-| Feed cache RAM | 100-150 GB provisioned |
-| Article and vector storage growth | 45-50 TB/year with overhead |
+## 1. News Ingestion
 
-These numbers are planning estimates, not production requirements. They should be revisited using real traffic, article size, cache hit rate, and consumer-lag measurements.
+News enters the platform through independent producers for sources such as:
 
-## Key Tradeoffs
+- RSS feeds
+- News websites
+- Social media
 
-### Fan-out-on-read
+These producers publish incoming news articles to **Kafka**.
 
-Feeds are assembled from topic-level Redis indexes when requested instead of maintaining a precomputed feed for every user. This avoids large write amplification for a content-heavy product, at the cost of merge, rerank, and diversification work on each read.
+Kafka is used to handle high-volume processing and decouple services. A service can consume the output produced by an earlier stage and publish its own output for downstream services.
 
-### Asynchronous processing
+## 2. Normalization
 
-The multi-stage Kafka pipeline provides fault isolation and independent scaling. The tradeoff is that freshness depends on the slowest stage, so the platform should measure end-to-end latency and consumer lag rather than treating the system as strictly real-time.
+The **Normalization Service** consumes raw news articles from Kafka and converts them into a consistent internal article representation.
 
-### Embedding similarity
+After normalization:
 
-A similarity threshold controls the balance between merging paraphrased coverage and keeping distinct stories separate. The threshold should be configurable and monitored, with title or URL matching available as a secondary signal.
+1. The normalized article is persisted in the database.
+2. A duplicate-identification job is published to Kafka.
 
-### Centroid-based clustering
+## 3. Deduplication
 
-Comparing new articles with story centroids is more tractable than comparing against every article. Long-running stories can still experience centroid drift, so periodic re-anchoring or bounded centroid updates may be needed.
+The **Deduplication Service** determines whether a normalized article is already represented by an existing article.
 
-### Primary database and vector database
+The proposed flow is:
 
-Using a document store for article data and a vector database for similarity search lets each system serve its primary workload. Because the writes are not atomic across both systems, ingestion should use idempotent keys, retries, and an outbox or reconciliation process.
+1. Compute a vector embedding for the article.
+2. Run a similarity search against existing article vectors.
+3. If the article is a duplicate:
+   - Update the original article's **frequency/source count**.
+   - Update the set of **news sources** covering it.
+   - Update recency where appropriate.
+4. If it is not a duplicate:
+   - Publish a clustering request to Kafka.
 
-## Failure Modes to Monitor
+A dedicated **Vector DB** such as Pinecone or Weaviate can store embeddings so vector similarity search remains independent and optimized.
 
-- Duplicate stories leaking into feeds when similarity checks miss paraphrases.
-- Hot clusters causing repeated rank recomputations during breaking news.
-- Kafka consumer lag cascading into downstream freshness delays.
-- Redis restarts causing a cache miss storm against the primary database.
-- Reliability-score service failures blocking or degrading ranking.
-- Low-quality source floods artificially inflating source-count popularity.
+The design proposes **DynamoDB** for high-volume article data storage.
 
-Useful mitigations include secondary deduplication signals, batched ranking updates, per-stage lag alerts, Redis warm-up jobs, cached default reliability scores, and reputation-weighted source counts.
+## 4. Online Story Clustering
 
-## Open Design Questions
+Incoming unique articles must be grouped into stories while data is continuously arriving, so the architecture uses an **online clustering** approach.
 
-- What are the target freshness and availability SLOs?
-- Which article and story fields belong in the primary database versus Redis?
-- How will similarity thresholds be tuned and evaluated offline?
-- How will source reliability be calculated and refreshed?
-- What retention policy applies to raw articles, embeddings, and completed clusters?
-- Which personalization signals should be applied during feed assembly?
+Each story cluster maintains a **centroid vector**.
 
-## Related Notes
+For every new article:
 
-- [BOE.md](BOE.md) - Capacity estimates and component-level sizing.
-- [Failure-&-Tradeoffs.md](Failure-&-Tradeoffs.md) - Detailed tradeoffs, failure modes, and mitigations.
+1. Fetch the article embedding.
+2. Compare it against existing cluster centroid vectors.
+3. If similarity is approximately **95% or greater**, add the article to that cluster.
+4. Update the cluster centroid.
+5. Otherwise, create a new cluster.
+
+The clustering service stores or updates cluster information in DynamoDB and publishes downstream jobs through Kafka.
+
+> The 95% similarity threshold is the threshold shown in the design and would need tuning using production data.
+
+## 5. Cluster Labelling
+
+The **Cluster Labelling Service** assigns categories to story clusters, for example:
+
+- Sports
+- Finance
+- Entertainment
+
+These labels are later used to efficiently build personalized feeds.
+
+## 6. Story Ranking
+
+Ranking happens at the **story/cluster level**, not at the individual article level.
+
+A cluster's rank is recomputed when:
+
+- A new article is added to the cluster, or
+- A new cluster is created.
+
+The ranking service uses signals including:
+
+- **Freshness / recency**
+- **Source count**
+- **Relevance**
+- **Source reliability**
+- **Popularity**
+
+The example score in the design is:
+
+```text
+Score =
+    0.30 * freshness
+  + 0.25 * sourceCount
+  + 0.20 * relevance
+  + 0.15 * reliability
+  + 0.10 * popularity
+```
+
+The diagram notes that:
+
+- Source count is updated during article deduplication.
+- Recency is updated during article deduplication.
+- Source reliability can initially come from an external service.
+- The exact relevance signal is still **TODO** in the design.
+
+Updated rankings are written to **Redis**.
+
+## 7. Ranked Topic Pools in Redis
+
+Redis maintains **sorted sets of top-ranked stories for each topic**.
+
+Conceptually:
+
+```text
+sports        -> ranked story IDs
+finance       -> ranked story IDs
+entertainment -> ranked story IDs
+...
+```
+
+This avoids scanning and ranking the complete story database every time a user requests a feed.
+
+The persistent database remains the source of truth, while Redis acts as the fast serving layer for ranked story pools.
+
+## 8. Personalized Feed Generation
+
+The system does **not** precompute and store a separate feed for every user.
+
+Instead, it uses **fan-out on read**.
+
+When a user requests:
+
+```http
+GET /feed
+```
+
+The request flows through:
+
+```text
+User -> API Gateway -> Feed Service
+```
+
+The Feed Service then:
+
+1. Determines the topics the user is interested in.
+2. Fetches the **top-N stories** from Redis for each relevant topic.
+3. Merges the results into a candidate set.
+4. Deduplicates overlapping candidates.
+5. Personally reranks and diversifies the candidates using signals such as:
+   - User interests
+   - Freshness
+   - Global story score
+6. Returns the final **top-K stories**.
+
+In compact form:
+
+```text
+User interests
+      │
+      v
+Top-N stories/topic from Redis
+      │
+      v
+Merge + deduplicate
+      │
+      v
+Personal reranking + diversification
+      │
+      v
+Top-K feed
+```
+
+## 9. Caching
+
+Redis is used as the main low-latency cache/serving layer for ranked topic pools.
+
+The feed path also shows a database fallback:
+
+```text
+Feed Service -> Redis
+                  │
+             cache miss
+                  │
+                  v
+                 DB
+                  │
+             populate cache
+                  │
+                  v
+                Redis
+```
+
+This keeps common feed reads away from the primary database while preserving a fallback when data is absent from cache.
+
+## Storage Responsibilities
+
+| Storage | Responsibility |
+|---|---|
+| **DynamoDB** | Persistent article and cluster data; selected for high-volume access patterns in the design. |
+| **Vector DB** | Article embeddings and cluster centroid vectors used for similarity search. |
+| **Redis** | Ranked per-topic story pools and cached data required by the feed-serving path. |
+| **Kafka** | Event/job transport between ingestion and processing services. |
+
+## End-to-End Data Flow
+
+```text
+1. Source produces article
+        │
+        v
+2. Kafka
+        │
+        v
+3. Normalize article
+        │
+        v
+4. Persist normalized article
+        │
+        v
+5. Deduplicate using vector similarity
+        │
+        ├── Duplicate -> update source count / sources / recency
+        │
+        └── Unique
+              │
+              v
+6. Online clustering
+        │
+        ├── Match existing centroid -> update cluster
+        └── No match -> create cluster
+              │
+              v
+7. Label cluster
+        │
+        v
+8. Compute/update story rank
+        │
+        v
+9. Update topic sorted sets in Redis
+        │
+        v
+10. User requests feed
+        │
+        v
+11. Fetch top-N stories from interested topics
+        │
+        v
+12. Merge + deduplicate + rerank + diversify
+        │
+        v
+13. Return top-K personalized stories
+```
+
+## Key Design Decisions
+
+### Event-driven processing
+
+Kafka isolates stages of the processing pipeline. Producers and consumers do not need to execute synchronously, making it easier for individual stages to scale independently.
+
+### Story-level ranking
+
+The system ranks **clusters/stories rather than individual articles**. Multiple publishers covering the same event therefore contribute signals to one story instead of flooding the feed with near-identical articles.
+
+### Online clustering
+
+Because articles arrive continuously, clustering happens incrementally instead of periodically recomputing all clusters from scratch.
+
+### Vector search separated from operational storage
+
+Embeddings and centroid similarity searches are handled by a vector database, while article and cluster metadata remain in DynamoDB.
+
+### Fan-out on read
+
+The design maintains ranked topic pools rather than materializing a feed for every user. Personalized feeds are assembled only when requested.
+
+## Components
+
+```text
+Ingestion
+├── RSS Feed Producer
+├── Website Producer
+└── Social Media Producer
+
+Processing
+├── Normalization Service
+├── Deduplication Service
+├── Clustering Service
+├── Cluster Labelling Service
+└── Ranking Service
+
+Serving
+├── API Gateway
+└── Feed Service
+
+Infrastructure
+├── Kafka
+├── DynamoDB
+├── Vector DB
+└── Redis
+```
+
+## Open Items From the Design
+
+The diagram explicitly leaves the exact **relevance** calculation as a TODO. The ranking weights and online-clustering similarity threshold are also example design parameters rather than validated production values.
+
+---
+
+This repository contains the high-level architecture for a scalable news aggregator focused on **stream processing, story deduplication/clustering, story-level ranking, and low-latency personalized feed generation**.
